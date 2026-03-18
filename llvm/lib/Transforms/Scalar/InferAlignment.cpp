@@ -24,6 +24,7 @@
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Utils/Local.h"
+#include <optional>
 
 using namespace llvm;
 using namespace llvm::PatternMatch;
@@ -120,6 +121,50 @@ bool inferAlignment(Function &F, AssumptionCache &AC, DominatorTree &DT) {
     return Align(1ull << std::min(Known.getBitWidth() - 1, TrailZ));
   };
 
+  // Helper function to quickly compute alignment from common patterns
+  std::function<std::optional<Align>(Value *)> getIndexAlignmentFromPattern =
+      [&](Value *Idx) -> std::optional<Align> {
+    // Pattern: shl X, N -> alignment of 2^N
+    const APInt *ShiftAmt;
+    if (match(Idx, m_Shl(m_Value(), m_APInt(ShiftAmt)))) {
+      uint64_t Shift = ShiftAmt->getZExtValue();
+      if (Shift > 0 && Shift <= 63)
+        return Align(1ull << Shift);
+    }
+
+    // Pattern: mul X, C where C is a power of 2 -> alignment of C
+    const APInt *MulC;
+    if (match(Idx, m_Mul(m_Value(), m_APInt(MulC))) ||
+        match(Idx, m_Mul(m_APInt(MulC), m_Value()))) {
+      uint64_t Val = MulC->getZExtValue();
+      if (isPowerOf2_64(Val))
+        return Align(Val);
+    }
+
+    // Pattern: add X, C -> GCD of X's alignment and C
+    Value *AddOp;
+    const APInt *AddC;
+    if (match(Idx, m_Add(m_Value(AddOp), m_APInt(AddC))) ||
+        match(Idx, m_Add(m_APInt(AddC), m_Value(AddOp)))) {
+      if (auto XAlign = getIndexAlignmentFromPattern(AddOp))
+        return commonAlignment(*XAlign, AddC->getZExtValue());
+    }
+
+    // Pattern: sub X, C -> GCD of X's alignment and C
+    if (match(Idx, m_Sub(m_Value(AddOp), m_APInt(AddC)))) {
+      if (auto XAlign = getIndexAlignmentFromPattern(AddOp))
+        return commonAlignment(*XAlign, AddC->getZExtValue());
+    }
+
+    // Pattern: sext/zext - extensions preserve alignment
+    Value *CastSrc;
+    if (match(Idx, m_SExt(m_Value(CastSrc))) ||
+        match(Idx, m_ZExt(m_Value(CastSrc))))
+      return getIndexAlignmentFromPattern(CastSrc);
+
+    return std::nullopt;
+  };
+
   // Helper function to compute variable offset alignment and base pointer
   // If ConstOffset > 0, the effective offset alignment is limited by the
   // constant offset
@@ -128,47 +173,35 @@ bool inferAlignment(Function &F, AssumptionCache &AC, DominatorTree &DT) {
           uint64_t ConstOffset = 0) -> std::pair<Value *, Align> {
     Align VarOffsetAlign = Align(1);
     Value *VarBasePtr = Ptr;
-    bool FirstGEP = true;
-    while (true) {
-      if (auto *GEP = dyn_cast<GEPOperator>(VarBasePtr)) {
-        // We can only handle GEPs with a single index
-        if (GEP->getNumIndices() != 1)
-          break;
 
+    if (auto *GEP = dyn_cast<GEPOperator>(VarBasePtr)) {
+      // We can only handle GEPs with a single index
+      if (GEP->getNumIndices() == 1) {
         Value *Idx = GEP->idx_begin()->get();
-        KnownBits Known = computeKnownBits(Idx, DL, &AC, I, &DT);
-        unsigned TrailZ = std::min(Known.countMinTrailingZeros(),
-                                   +Value::MaxAlignmentExponent);
-        Align IndexAlign(1ull << std::min(Known.getBitWidth() - 1, TrailZ));
+        Align IndexAlign(1);
+
+        if (auto PatternAlign = getIndexAlignmentFromPattern(Idx)) {
+          IndexAlign = *PatternAlign;
+        }
+        // If pattern matching fails, IndexAlign remains 1 (no alignment from
+        // variable offset)
         Type *EltTy = GEP->getSourceElementType();
         TypeSize EltSizeType = DL.getTypeAllocSize(EltTy);
 
-        // If we encounter a scalable type, we can't compute alignment for the
-        // chain
-        if (EltSizeType.isScalable())
-          break;
+        // If we encounter a scalable type, we can't compute alignment
+        if (!EltSizeType.isScalable()) {
+          uint64_t EltSize = EltSizeType.getFixedValue();
 
-        uint64_t EltSize = EltSizeType.getFixedValue();
-
-        // Compute offset alignment: multiply index alignment by element size,
-        // then take the greatest power of 2 that divides the product
-        uint64_t Product = IndexAlign.value() * EltSize;
-        uint64_t ProductAlignValue = Product > 0 ? (Product & (~Product + 1))
-                                                 : 1; // Extract lowest set bit
-        Align GEPOffsetAlign = Align(ProductAlignValue);
-        if (FirstGEP) {
-          VarOffsetAlign = GEPOffsetAlign;
-          FirstGEP = false;
-        } else {
-          // When combining offsets that are added together, use GCD
-          // (commonAlignment)
-          VarOffsetAlign =
-              commonAlignment(VarOffsetAlign, GEPOffsetAlign.value());
+          // Compute offset alignment: multiply index alignment by element size,
+          // then take the greatest power of 2 that divides the product
+          uint64_t Product = IndexAlign.value() * EltSize;
+          uint64_t ProductAlignValue = Product > 0
+                                           ? (Product & (~Product + 1))
+                                           : 1; // Extract lowest set bit
+          VarOffsetAlign = Align(ProductAlignValue);
         }
 
         VarBasePtr = GEP->getPointerOperand();
-      } else {
-        break;
       }
     }
     VarBasePtr = VarBasePtr->stripPointerCasts();
